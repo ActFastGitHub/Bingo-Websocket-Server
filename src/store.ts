@@ -10,7 +10,10 @@ function stripPlayer(p: Player): Omit<Player, "lastSocketId"> {
 }
 
 function toPersist(room: RoomState) {
-  return { ...room, players: Array.from(room.players.values()).map(stripPlayer) };
+  return {
+    ...room,
+    players: Array.from(room.players.values()).map(stripPlayer),
+  };
 }
 
 function fromPersist(raw: any): RoomState {
@@ -29,6 +32,7 @@ function fromPersist(raw: any): RoomState {
     locked: !!raw.locked,
     roundId: raw.roundId || 0,
     winners: (raw.winners || []) as RoundWinner[],
+    hostKey: String(raw.hostKey || ""),          // persist hostKey
   };
 }
 

@@ -43,4 +43,5 @@ export type RoomState = {
   locked: boolean;
   roundId: number;
   winners: RoundWinner[];
+  hostKey: string;           // NEW – secret required for host actions
 };

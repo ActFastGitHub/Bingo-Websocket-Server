@@ -20,7 +20,7 @@ const makeHostKey = () =>
 
 const app = express();
 
-// ⚠️ Add your Vercel domain
+// ⚠️ Add your Vercel domain here
 const allowedOrigins = ["http://localhost:3000", "https://YOUR-VERCEL-APP.vercel.app"];
 app.use(cors({ origin: allowedOrigins, methods: ["GET", "POST"] }));
 
@@ -50,6 +50,7 @@ async function setupAdapter() {
 }
 setupAdapter().catch(console.error);
 
+// in-memory cache + redis
 const rooms = new Map<string, RoomState>();
 async function getRoom(code: string) {
 	const c = norm(code);
@@ -119,9 +120,11 @@ const JoinSchema = z.object({
 	manual: z.boolean().optional(),
 	marks: z.array(z.array(z.tuple([z.number().int(), z.number().int()]))).optional()
 });
+const KeySchema = z.object({ code: z.string().trim().length(6), hostKey: z.string().trim().min(8) });
 
+// ---------- SOCKET ----------
 io.on("connection", socket => {
-	// quick probes
+	// probes
 	socket.on("room:exists", async (code: string, cb: (r: { ok: boolean }) => void) =>
 		cb({ ok: !!(await getRoom(code)) })
 	);
@@ -132,7 +135,7 @@ io.on("connection", socket => {
 		cb({ ok: true, summary: summarize(room) });
 	});
 
-	// ---- HOST FLOW (requires hostKey) ----
+	// HOST create
 	socket.on(
 		"host:create_room",
 		async (_: unknown, cb: (p: { code: string; seed: number; hostKey: string }) => void) => {
@@ -161,21 +164,13 @@ io.on("connection", socket => {
 		}
 	);
 
-	const KeySchema = z.object({ code: z.string().trim().length(6), hostKey: z.string().trim().min(8) });
-
-	socket.on(
-		"host:resume_info",
-		async (payload: { code: string }, cb: (r: { ok: boolean; msg?: string; found?: boolean }) => void) => {
-			const room = await getRoom(payload.code);
-			cb({ ok: true, found: !!room });
-		}
-	);
-
+	// HOST — strict validations
 	socket.on("host:set_pattern", async (payload: { code: string; hostKey: string; pattern: PatternType }) => {
 		const p = KeySchema.safeParse(payload);
 		if (!p.success) return;
 		const room = await getRoom(p.data.code);
 		if (!room || room.hostKey !== p.data.hostKey) return;
+		if (room.started) return; // 🚫 cannot change pattern mid-round
 		room.pattern = payload.pattern;
 		await putRoom(room);
 		io.to(room.code).emit("room:updated", summarize(room));
@@ -186,17 +181,19 @@ io.on("connection", socket => {
 		if (!p.success) return;
 		const room = await getRoom(p.data.code);
 		if (!room || room.hostKey !== p.data.hostKey) return;
+		// allowed mid-round
 		room.allowAutoMark = !!payload.allow;
-		if (!room.allowAutoMark)
+		if (!room.allowAutoMark) {
 			for (const pl of room.players.values()) {
 				pl.autoMark = false;
 				pl.manual = true;
 				if (pl.lastSocketId) io.to(pl.lastSocketId).emit("policy:allow_automark", false);
 			}
-		else
+		} else {
 			for (const pl of room.players.values()) {
 				if (pl.lastSocketId) io.to(pl.lastSocketId).emit("policy:allow_automark", true);
 			}
+		}
 		await putRoom(room);
 		io.to(room.code).emit("policy:allow_automark", room.allowAutoMark);
 		io.to(room.code).emit("room:updated", summarize(room));
@@ -223,12 +220,13 @@ io.on("connection", socket => {
 		io.to(room.code).emit("room:updated", summarize(room));
 	});
 
+	// START / END
 	socket.on("host:start", async (payload: { code: string; hostKey: string }) => {
 		const p = KeySchema.safeParse(payload);
 		if (!p.success) return;
 		const room = await getRoom(p.data.code);
 		if (!room || room.hostKey !== p.data.hostKey) return;
-
+		if (room.started) return; // 🚫 already started
 		room.started = true;
 		room.called = [];
 		room.deck = makeDeck(room.seed);
@@ -247,13 +245,26 @@ io.on("connection", socket => {
 		io.to(room.code).emit("room:updated", summarize(room));
 	});
 
+	socket.on("host:end_round", async (payload: { code: string; hostKey: string }) => {
+		const p = KeySchema.safeParse(payload);
+		if (!p.success) return;
+		const room = await getRoom(p.data.code);
+		if (!room || room.hostKey !== p.data.hostKey) return;
+		if (!room.started) return;
+		room.started = false; // keep called history visible until next start
+		await putRoom(room);
+		io.to(room.code).emit("game:ended", { code: room.code, roundId: room.roundId });
+		io.to(room.code).emit("room:updated", summarize(room));
+	});
+
+	// CALL / UNDO
 	socket.on("host:call_next", async (payload: { code: string; hostKey: string }) => {
 		const p = KeySchema.safeParse(payload);
 		if (!p.success) return;
 		const room = await getRoom(p.data.code);
 		if (!room || !room.started || room.hostKey !== p.data.hostKey) return;
 		const next = room.deck.shift();
-		if (!next) return;
+		if (!next) return; // 🚫 deck empty
 		room.called.push(next);
 		await putRoom(room);
 		io.to(room.code).emit("game:called", { n: next, history: room.called, roundId: room.roundId });
@@ -270,10 +281,9 @@ io.on("connection", socket => {
 		io.to(room.code).emit("game:undo", { history: room.called, roundId: room.roundId });
 	});
 
-	// ---- PLAYER FLOW (unchanged) ----
-	const Join = JoinSchema;
+	// PLAYER join / marks / claim (unchanged)
 	socket.on("player:join", async (payload, cb) => {
-		const parsed = Join.safeParse(payload);
+		const parsed = JoinSchema.safeParse(payload);
 		if (!parsed.success) return cb({ ok: false, msg: "Invalid join data" });
 		const code = norm(parsed.data.code);
 		let room = await getRoom(code);

@@ -1,45 +1,46 @@
 import type { PatternType } from "./patterns";
 
 export type Player = {
-  // A player is keyed by stable clientId, not socket.id
-  clientId: string;
-  name: string;
-  // Multiple cards support
-  cards: number[][][];          // array of 5x5 cards
-  activeCard: number;           // current card index (0-based)
-  // Preferences
+  clientId: string;                 // stable identity
+  name: string;                     // sticky name for this room
+  cards: number[][][];              // multiple 5x5 cards
+  activeCard: number;               // index
   autoMark?: boolean;
   manual?: boolean;
-  // Per-card manual marks
-  marks: [number, number][][];  // same length as cards
-  // Anti-spam
+  marks: [number, number][][];      // per-card manual marks
   lastClaimAt?: number;
-  // Last known socket id (for targeted emits)
   lastSocketId?: string;
 };
 
 export type BingoWinner = {
-  playerId: string;    // clientId
+  playerId: string;                 // clientId
   name: string;
-  cardIndex: number;   // which card won
+  cardIndex: number;
   pattern: string;
   proofCard: number[][];
   at: number;
   roundId: number;
 };
 
-export type RoundWinner = { playerId: string; name: string; pattern: string; at: number; cardIndex: number };
+export type RoundWinner = {
+  playerId: string;
+  name: string;
+  pattern: string;
+  at: number;
+  cardIndex: number;
+};
 
 export type RoomState = {
   code: string;
   seed: number;
   deck: number[];
   called: number[];
-  // players keyed by clientId
-  players: Map<string, Player>;
+  players: Map<string, Player>;     // key = clientId
   started: boolean;
   pattern: PatternType;
-  allowAutoMark: boolean;
+  allowAutoMark: boolean;           // policy
+  lockLobbyOnStart: boolean;        // host preference
+  locked: boolean;                  // current room lock state (no new joins)
   roundId: number;
   winners: RoundWinner[];
 };

@@ -12,7 +12,7 @@ const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n
 
 const app = express();
 
-// ⚠️ Put your real Vercel URL below
+// ⚠️ Set your deployed Vercel domain here
 const allowedOrigins = [
   "http://localhost:3000",
   "https://YOUR-VERCEL-APP.vercel.app",
@@ -26,10 +26,10 @@ const io = new Server(server, {
   transports: ["websocket"],
 });
 
-// In-memory rooms
+// Rooms in memory
 const rooms = new Map<string, RoomState>();
 
-// Track which socket belongs to which { code, clientId }
+// socket.id → { code, clientId }
 const socketIndex = new Map<string, { code: string; clientId: string }>();
 
 function genRoomCode(): string {
@@ -38,7 +38,9 @@ function genRoomCode(): string {
   for (let i = 0; i < 6; i++) code += alphabet[Math.floor(Math.random() * alphabet.length)];
   return code;
 }
-function randomSeed(): number { return Math.floor(Math.random() * 2 ** 31); }
+function randomSeed(): number {
+  return Math.floor(Math.random() * 2 ** 31);
+}
 function hashStr(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24); }
@@ -52,10 +54,7 @@ function sanitizeMarks(marks: [number, number][]): [number, number][] {
     if (!Number.isInteger(r) || !Number.isInteger(c)) continue;
     if (r < 0 || r > 4 || c < 0 || c > 4) continue;
     const key = `${r}-${c}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push([r, c]);
-    }
+    if (!seen.has(key)) { seen.add(key); out.push([r, c]); }
     if (out.length >= 25) break;
   }
   return out;
@@ -67,11 +66,17 @@ function summarize(room: RoomState) {
     started: room.started,
     calledCount: room.called.length,
     last: room.called[room.called.length - 1] ?? null,
-    players: Array.from(room.players.values()).map((p) => ({ id: p.clientId, name: p.name, cards: p.cards.length })),
+    players: Array.from(room.players.values()).map((p) => ({
+      id: p.clientId,
+      name: p.name,
+      cards: p.cards.length,
+    })),
     roundId: room.roundId,
     winners: room.winners,
     pattern: room.pattern,
     allowAutoMark: room.allowAutoMark,
+    locked: room.locked,
+    lockLobbyOnStart: room.lockLobbyOnStart,
   };
 }
 
@@ -86,16 +91,21 @@ const JoinSchema = z.object({
 });
 
 io.on("connection", (socket) => {
-  // 👀 NEW: let non-joined clients subscribe to updates (join screen)
+  /** Pre-join watch & existence checks (prevents “room not found” races) */
+  socket.on("room:exists", (code: string, cb: (res: { ok: boolean }) => void) => {
+    code = norm(code);
+    cb({ ok: rooms.has(code) });
+  });
+
   socket.on("room:watch", (code: string, cb: (res: { ok: boolean; summary?: any; msg?: string }) => void) => {
     code = norm(code);
     const room = rooms.get(code);
     if (!room) return cb({ ok: false, msg: "Room not found" });
-    socket.join(code);                     // subscribe to room broadcasts
-    cb({ ok: true, summary: summarize(room) }); // send current settings
+    socket.join(code);
+    cb({ ok: true, summary: summarize(room) });
   });
 
-  // HOST: create room
+  /** Host: create room */
   socket.on("host:create_room", (_: unknown, cb: (payload: { code: string; seed: number }) => void) => {
     const code = genRoomCode();
     const seed = randomSeed();
@@ -107,6 +117,8 @@ io.on("connection", (socket) => {
       started: false,
       pattern: "line",
       allowAutoMark: true,
+      lockLobbyOnStart: true,  // default ON (safer)
+      locked: false,
       roundId: 0,
       winners: [],
     };
@@ -116,7 +128,7 @@ io.on("connection", (socket) => {
     io.to(code).emit("room:updated", summarize(room));
   });
 
-  // HOST: set winning pattern
+  /** Host: set winning pattern */
   socket.on("host:set_pattern", (payload: { code: string; pattern: PatternType }) => {
     const code = norm(payload.code);
     const room = rooms.get(code);
@@ -125,31 +137,66 @@ io.on("connection", (socket) => {
     io.to(code).emit("room:updated", summarize(room));
   });
 
-  // HOST: allow/disallow auto-mark
+  /** Host: toggle allowAutoMark policy (authoritative + broadcast explicit policy event) */
   socket.on("host:set_allow_automark", (payload: { code: string; allow: boolean }) => {
     const code = norm(payload.code);
     const room = rooms.get(code);
     if (!room) return;
     room.allowAutoMark = !!payload.allow;
+
     if (!room.allowAutoMark) {
       for (const p of room.players.values()) {
         p.autoMark = false;
         p.manual = true;
+        if (p.lastSocketId) io.to(p.lastSocketId).emit("policy:allow_automark", false);
+      }
+    } else {
+      for (const p of room.players.values()) {
+        if (p.lastSocketId) io.to(p.lastSocketId).emit("policy:allow_automark", true);
       }
     }
+
+    io.to(code).emit("policy:allow_automark", room.allowAutoMark);
     io.to(code).emit("room:updated", summarize(room));
   });
 
-  // HOST: start round
+  /** Host: set lockLobbyOnStart preference (applies when Start is pressed) */
+  socket.on("host:set_lock_on_start", (payload: { code: string; lockOnStart: boolean }) => {
+    const code = norm(payload.code);
+    const room = rooms.get(code);
+    if (!room) return;
+    room.lockLobbyOnStart = !!payload.lockOnStart;
+    io.to(code).emit("room:updated", summarize(room));
+  });
+
+  /** Host: manual lock/unlock lobby (between rounds typically) */
+  socket.on("host:set_locked", (payload: { code: string; locked: boolean }) => {
+    const code = norm(payload.code);
+    const room = rooms.get(code);
+    if (!room) return;
+    room.locked = !!payload.locked;
+    io.to(code).emit("policy:locked", room.locked);
+    io.to(code).emit("room:updated", summarize(room));
+  });
+
+  /** Host: start round (optionally locks lobby) */
   socket.on("host:start", (code: string) => {
     code = norm(code);
     const room = rooms.get(code);
     if (!room) return;
+
     room.started = true;
     room.called = [];
     room.deck = makeDeck(room.seed);
     room.roundId += 1;
     room.winners = [];
+
+    // Lock lobby if preference is on
+    if (room.lockLobbyOnStart) {
+      room.locked = true;
+      io.to(code).emit("policy:locked", true);
+    }
+
     for (const p of room.players.values()) {
       p.marks = p.cards.map(() => []);
       p.lastClaimAt = 0;
@@ -158,7 +205,7 @@ io.on("connection", (socket) => {
     io.to(code).emit("room:updated", summarize(room));
   });
 
-  // HOST: call next number
+  /** Host: draw/undo */
   socket.on("host:call_next", (code: string) => {
     code = norm(code);
     const room = rooms.get(code);
@@ -169,7 +216,6 @@ io.on("connection", (socket) => {
     io.to(code).emit("game:called", { n: next, history: room.called, roundId: room.roundId });
   });
 
-  // HOST: undo last
   socket.on("host:undo", (code: string) => {
     code = norm(code);
     const room = rooms.get(code);
@@ -179,7 +225,7 @@ io.on("connection", (socket) => {
     io.to(code).emit("game:undo", { history: room.called, roundId: room.roundId });
   });
 
-  // PLAYER: join (reconnect + multi-cards)
+  /** Player: join / reconnect (name is sticky; lobby lock honored) */
   socket.on("player:join", (payload, cb) => {
     const parsed = JoinSchema.safeParse(payload);
     if (!parsed.success) return cb({ ok: false, msg: "Invalid join data" });
@@ -194,8 +240,14 @@ io.on("connection", (socket) => {
     socketIndex.set(socket.id, { code, clientId });
 
     let player = room.players.get(clientId);
+
+    // If lobby is locked and this clientId isn't already in, block join
+    if (!player && room.locked) {
+      return cb({ ok: false, msg: "Lobby is locked. Please wait for the next round." });
+    }
+
     if (player) {
-      player.name = parsed.data.name || player.name;
+      // Sticky name: ignore attempts to rename mid-session
       player.lastSocketId = socket.id;
       return cb({
         ok: true,
@@ -203,9 +255,11 @@ io.on("connection", (socket) => {
         roundId: room.roundId,
         allowAutoMark: room.allowAutoMark,
         activeCard: player.activeCard,
+        name: player.name, // send sticky name back
       });
     }
 
+    // New player
     const count = clamp(parsed.data.cardCount ?? 1, 1, 4);
     const cards: number[][][] = [];
     for (let i = 0; i < count; i++) {
@@ -220,7 +274,7 @@ io.on("connection", (socket) => {
 
     player = {
       clientId,
-      name: parsed.data.name,
+      name: parsed.data.name, // initial sticky name
       cards,
       activeCard: 0,
       autoMark: useAuto,
@@ -237,11 +291,12 @@ io.on("connection", (socket) => {
       roundId: room.roundId,
       allowAutoMark: room.allowAutoMark,
       activeCard: player.activeCard,
+      name: player.name,
     });
     io.to(code).emit("room:updated", summarize(room));
   });
 
-  // PLAYER: switch active card
+  /** Player: switch active card */
   socket.on("player:switch_card", (code: string, clientId: string, cardIndex: number) => {
     code = norm(code);
     const room = rooms.get(code);
@@ -253,19 +308,18 @@ io.on("connection", (socket) => {
     io.to(clientId).emit("player:active_card", idx);
   });
 
-  // PLAYER: update marks for one card (manual mode)
+  /** Player: update marks (manual mode) */
   socket.on("player:update_marks", (code: string, clientId: string, cardIndex: number, marks: [number, number][]) => {
     code = norm(code);
     const room = rooms.get(code);
     if (!room) return;
     const player = room.players.get(clientId);
-    if (!player) return;
-    if (!player.manual) return;
+    if (!player || !player.manual) return;
     const idx = clamp(cardIndex, 0, player.cards.length - 1);
     player.marks[idx] = sanitizeMarks(marks);
   });
 
-  // PLAYER: claim bingo on a specific card
+  /** Player: claim bingo (per card) */
   socket.on("player:claim_bingo", (code: string, clientId: string, cardIndex: number, cb: (res: { ok: boolean; msg?: string }) => void) => {
     code = norm(code);
     const room = rooms.get(code);
@@ -274,10 +328,9 @@ io.on("connection", (socket) => {
     const player = room.players.get(clientId);
     if (!player) return cb({ ok: false, msg: "Player not in room" });
 
-    // Cooldown 2s
     const now = Date.now();
     if (player.lastClaimAt && now - player.lastClaimAt < 2000) {
-      return cb({ ok: false, msg: "Please wait a moment before claiming again" });
+      return cb({ ok: false, msg: "Please wait before claiming again" });
     }
     player.lastClaimAt = now;
 
@@ -285,7 +338,6 @@ io.on("connection", (socket) => {
     const card = player.cards[idx];
     const calledSet = new Set(room.called);
 
-    // If manual, keep only correct marks (FREE or called)
     if (player.manual) {
       const before = player.marks[idx].length;
       player.marks[idx] = player.marks[idx].filter(([r, c]) => {
@@ -310,8 +362,8 @@ io.on("connection", (socket) => {
         at: room.called.length,
         roundId: room.roundId,
       };
-      const wBrief: RoundWinner = { playerId: winner.playerId, name: winner.name, pattern: winner.pattern, at: winner.at, cardIndex: idx };
-      room.winners.push(wBrief);
+      const brief: RoundWinner = { playerId: winner.playerId, name: winner.name, pattern: winner.pattern, at: winner.at, cardIndex: idx };
+      room.winners.push(brief);
       io.to(code).emit("game:winner", winner);
       io.to(code).emit("room:winners", room.winners);
       io.to(code).emit("room:updated", summarize(room));
@@ -320,7 +372,7 @@ io.on("connection", (socket) => {
     cb({ ok: true });
   });
 
-  // We keep players in memory on disconnect (reconnect-friendly)
+  /** Keep players in memory; just clear socket index */
   socket.on("disconnecting", () => {
     const info = socketIndex.get(socket.id);
     if (info) socketIndex.delete(socket.id);

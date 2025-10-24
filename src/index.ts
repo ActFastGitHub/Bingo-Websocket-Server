@@ -3,16 +3,22 @@ import http from "http";
 import cors from "cors";
 import { Server } from "socket.io";
 import { z } from "zod";
+import { createAdapter } from "@socket.io/redis-adapter";
+import { createClient } from "redis";
+
 import { RoomState, Player, BingoWinner, RoundWinner } from "./types";
 import { makeCard, makeDeck } from "./game";
 import { PatternType, hasPattern } from "./patterns";
+import { saveRoom, loadRoom } from "./store";
+import { getRedis } from "./redis";
+import { mountAdmin } from "./admin";
 
 const norm = (s: string) => s.trim().toUpperCase();
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
 
 const app = express();
 
-// ⚠️ Set your deployed Vercel domain here
+// ⚠️ Add your Vercel domain here
 const allowedOrigins = [
   "http://localhost:3000",
   "https://YOUR-VERCEL-APP.vercel.app",
@@ -20,16 +26,55 @@ const allowedOrigins = [
 
 app.use(cors({ origin: allowedOrigins, methods: ["GET", "POST"] }));
 
+// Admin routes
+mountAdmin(app);
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: allowedOrigins, methods: ["GET", "POST"] },
-  transports: ["websocket"],
+  transports: ["websocket", "polling"],
 });
 
-// Rooms in memory
+// ----- Socket.IO Redis adapter -----
+async function setupAdapter() {
+  const url = process.env.REDIS_URL;
+  if (!url) {
+    console.warn("REDIS_URL not set. Running without Socket.IO Redis adapter.");
+    return;
+  }
+  const pubClient = createClient({ url });
+  const subClient = pubClient.duplicate();
+
+  pubClient.on("error", (e) => console.error("Redis pub error:", e));
+  subClient.on("error", (e) => console.error("Redis sub error:", e));
+
+  await pubClient.connect();
+  await subClient.connect();
+  io.adapter(createAdapter(pubClient, subClient));
+  console.log("✅ Socket.IO Redis adapter enabled");
+}
+setupAdapter().catch((e) => console.error("Adapter setup failed:", e));
+
+// ----- In-memory cache + Redis persistence -----
 const rooms = new Map<string, RoomState>();
 
-// socket.id → { code, clientId }
+async function getRoom(code: string): Promise<RoomState | null> {
+  const c = norm(code);
+  let room = rooms.get(c);
+  if (room) return room;
+  const loaded = await loadRoom(c);
+  if (loaded) {
+    rooms.set(c, loaded);
+    return loaded;
+  }
+  return null;
+}
+async function putRoom(room: RoomState): Promise<void> {
+  rooms.set(room.code, room);
+  await saveRoom(room);
+}
+
+// Socket index
 const socketIndex = new Map<string, { code: string; clientId: string }>();
 
 function genRoomCode(): string {
@@ -38,9 +83,7 @@ function genRoomCode(): string {
   for (let i = 0; i < 6; i++) code += alphabet[Math.floor(Math.random() * alphabet.length)];
   return code;
 }
-function randomSeed(): number {
-  return Math.floor(Math.random() * 2 ** 31);
-}
+function randomSeed(): number { return Math.floor(Math.random() * 2 ** 31); }
 function hashStr(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24); }
@@ -67,9 +110,7 @@ function summarize(room: RoomState) {
     calledCount: room.called.length,
     last: room.called[room.called.length - 1] ?? null,
     players: Array.from(room.players.values()).map((p) => ({
-      id: p.clientId,
-      name: p.name,
-      cards: p.cards.length,
+      id: p.clientId, name: p.name, cards: p.cards.length,
     })),
     roundId: room.roundId,
     winners: room.winners,
@@ -91,22 +132,19 @@ const JoinSchema = z.object({
 });
 
 io.on("connection", (socket) => {
-  /** Pre-join watch & existence checks (prevents “room not found” races) */
-  socket.on("room:exists", (code: string, cb: (res: { ok: boolean }) => void) => {
-    code = norm(code);
-    cb({ ok: rooms.has(code) });
+  socket.on("room:exists", async (code: string, cb: (res: { ok: boolean }) => void) => {
+    const room = await getRoom(code);
+    cb({ ok: !!room });
   });
 
-  socket.on("room:watch", (code: string, cb: (res: { ok: boolean; summary?: any; msg?: string }) => void) => {
-    code = norm(code);
-    const room = rooms.get(code);
+  socket.on("room:watch", async (code: string, cb: (res: { ok: boolean; summary?: any; msg?: string }) => void) => {
+    const room = await getRoom(code);
     if (!room) return cb({ ok: false, msg: "Room not found" });
-    socket.join(code);
+    socket.join(room.code);
     cb({ ok: true, summary: summarize(room) });
   });
 
-  /** Host: create room */
-  socket.on("host:create_room", (_: unknown, cb: (payload: { code: string; seed: number }) => void) => {
+  socket.on("host:create_room", async (_: unknown, cb: (payload: { code: string; seed: number }) => void) => {
     const code = genRoomCode();
     const seed = randomSeed();
     const room: RoomState = {
@@ -117,37 +155,33 @@ io.on("connection", (socket) => {
       started: false,
       pattern: "line",
       allowAutoMark: true,
-      lockLobbyOnStart: true,  // default ON (safer)
+      lockLobbyOnStart: true,
       locked: false,
       roundId: 0,
       winners: [],
     };
-    rooms.set(code, room);
+    await putRoom(room);
     socket.join(code);
     cb({ code, seed });
     io.to(code).emit("room:updated", summarize(room));
   });
 
-  /** Host: set winning pattern */
-  socket.on("host:set_pattern", (payload: { code: string; pattern: PatternType }) => {
-    const code = norm(payload.code);
-    const room = rooms.get(code);
+  socket.on("host:set_pattern", async (payload: { code: string; pattern: PatternType }) => {
+    const room = await getRoom(payload.code);
     if (!room) return;
     room.pattern = payload.pattern;
-    io.to(code).emit("room:updated", summarize(room));
+    await putRoom(room);
+    io.to(room.code).emit("room:updated", summarize(room));
   });
 
-  /** Host: toggle allowAutoMark policy (authoritative + broadcast explicit policy event) */
-  socket.on("host:set_allow_automark", (payload: { code: string; allow: boolean }) => {
-    const code = norm(payload.code);
-    const room = rooms.get(code);
+  socket.on("host:set_allow_automark", async (payload: { code: string; allow: boolean }) => {
+    const room = await getRoom(payload.code);
     if (!room) return;
     room.allowAutoMark = !!payload.allow;
 
     if (!room.allowAutoMark) {
       for (const p of room.players.values()) {
-        p.autoMark = false;
-        p.manual = true;
+        p.autoMark = false; p.manual = true;
         if (p.lastSocketId) io.to(p.lastSocketId).emit("policy:allow_automark", false);
       }
     } else {
@@ -156,33 +190,30 @@ io.on("connection", (socket) => {
       }
     }
 
-    io.to(code).emit("policy:allow_automark", room.allowAutoMark);
-    io.to(code).emit("room:updated", summarize(room));
+    await putRoom(room);
+    io.to(room.code).emit("policy:allow_automark", room.allowAutoMark);
+    io.to(room.code).emit("room:updated", summarize(room));
   });
 
-  /** Host: set lockLobbyOnStart preference (applies when Start is pressed) */
-  socket.on("host:set_lock_on_start", (payload: { code: string; lockOnStart: boolean }) => {
-    const code = norm(payload.code);
-    const room = rooms.get(code);
+  socket.on("host:set_lock_on_start", async (payload: { code: string; lockOnStart: boolean }) => {
+    const room = await getRoom(payload.code);
     if (!room) return;
     room.lockLobbyOnStart = !!payload.lockOnStart;
-    io.to(code).emit("room:updated", summarize(room));
+    await putRoom(room);
+    io.to(room.code).emit("room:updated", summarize(room));
   });
 
-  /** Host: manual lock/unlock lobby (between rounds typically) */
-  socket.on("host:set_locked", (payload: { code: string; locked: boolean }) => {
-    const code = norm(payload.code);
-    const room = rooms.get(code);
+  socket.on("host:set_locked", async (payload: { code: string; locked: boolean }) => {
+    const room = await getRoom(payload.code);
     if (!room) return;
     room.locked = !!payload.locked;
-    io.to(code).emit("policy:locked", room.locked);
-    io.to(code).emit("room:updated", summarize(room));
+    await putRoom(room);
+    io.to(room.code).emit("policy:locked", room.locked);
+    io.to(room.code).emit("room:updated", summarize(room));
   });
 
-  /** Host: start round (optionally locks lobby) */
-  socket.on("host:start", (code: string) => {
-    code = norm(code);
-    const room = rooms.get(code);
+  socket.on("host:start", async (code: string) => {
+    const room = await getRoom(code);
     if (!room) return;
 
     room.started = true;
@@ -191,79 +222,78 @@ io.on("connection", (socket) => {
     room.roundId += 1;
     room.winners = [];
 
-    // Lock lobby if preference is on
     if (room.lockLobbyOnStart) {
       room.locked = true;
-      io.to(code).emit("policy:locked", true);
+      io.to(room.code).emit("policy:locked", true);
     }
 
     for (const p of room.players.values()) {
-      p.marks = p.cards.map(() => []);
-      p.lastClaimAt = 0;
+      p.marks = p.cards.map(() => []); p.lastClaimAt = 0;
     }
-    io.to(code).emit("game:started", { code, roundId: room.roundId });
-    io.to(code).emit("room:updated", summarize(room));
+    await putRoom(room);
+    io.to(room.code).emit("game:started", { code: room.code, roundId: room.roundId });
+    io.to(room.code).emit("room:updated", summarize(room));
   });
 
-  /** Host: draw/undo */
-  socket.on("host:call_next", (code: string) => {
-    code = norm(code);
-    const room = rooms.get(code);
+  socket.on("host:call_next", async (code: string) => {
+    const room = await getRoom(code);
     if (!room || !room.started) return;
     const next = room.deck.shift();
     if (!next) return;
     room.called.push(next);
-    io.to(code).emit("game:called", { n: next, history: room.called, roundId: room.roundId });
+    await putRoom(room);
+    io.to(room.code).emit("game:called", { n: next, history: room.called, roundId: room.roundId });
   });
 
-  socket.on("host:undo", (code: string) => {
-    code = norm(code);
-    const room = rooms.get(code);
+  socket.on("host:undo", async (code: string) => {
+    const room = await getRoom(code);
     if (!room || !room.started || room.called.length === 0) return;
     const last = room.called.pop()!;
     room.deck.unshift(last);
-    io.to(code).emit("game:undo", { history: room.called, roundId: room.roundId });
+    await putRoom(room);
+    io.to(room.code).emit("game:undo", { history: room.called, roundId: room.roundId });
   });
 
-  /** Player: join / reconnect (name is sticky; lobby lock honored) */
-  socket.on("player:join", (payload, cb) => {
-    const parsed = JoinSchema.safeParse(payload);
+  socket.on("player:join", async (payload, cb) => {
+    const parsed = z.object({
+      code: z.string().trim().min(6).max(6),
+      name: z.string().trim().min(1).max(40),
+      clientId: z.string().trim().min(8).max(64),
+      cardCount: z.number().int().min(1).max(4).default(1),
+      autoMark: z.boolean().optional(),
+      manual: z.boolean().optional(),
+      marks: z.array(z.array(z.tuple([z.number().int(), z.number().int()]))).optional(),
+    }).safeParse(payload);
     if (!parsed.success) return cb({ ok: false, msg: "Invalid join data" });
 
     const code = norm(parsed.data.code);
-    const clientId = parsed.data.clientId.trim();
-    const room = rooms.get(code);
+    let room = await getRoom(code);
     if (!room) return cb({ ok: false, msg: "Room not found" });
 
     socket.join(code);
-    socket.join(clientId);
-    socketIndex.set(socket.id, { code, clientId });
+    socket.join(parsed.data.clientId);
+    socketIndex.set(socket.id, { code, clientId: parsed.data.clientId });
 
-    let player = room.players.get(clientId);
-
-    // If lobby is locked and this clientId isn't already in, block join
-    if (!player && room.locked) {
-      return cb({ ok: false, msg: "Lobby is locked. Please wait for the next round." });
-    }
+    let player = room.players.get(parsed.data.clientId);
+    if (!player && room.locked) return cb({ ok: false, msg: "Lobby is locked. Please wait for the next round." });
 
     if (player) {
-      // Sticky name: ignore attempts to rename mid-session
       player.lastSocketId = socket.id;
+      await putRoom(room);
       return cb({
         ok: true,
         cards: player.cards,
         roundId: room.roundId,
         allowAutoMark: room.allowAutoMark,
         activeCard: player.activeCard,
-        name: player.name, // send sticky name back
+        name: player.name,
       });
     }
 
-    // New player
     const count = clamp(parsed.data.cardCount ?? 1, 1, 4);
     const cards: number[][][] = [];
     for (let i = 0; i < count; i++) {
-      const salt = hashStr(`${clientId}#${i}`);
+      const salt = hashStr(`${parsed.data.clientId}#${i}`);
       cards.push(makeCard(room.seed, salt));
     }
 
@@ -273,8 +303,8 @@ io.on("connection", (socket) => {
     const marks = cards.map((_, i) => sanitizeMarks(incomingMarks[i] ?? []));
 
     player = {
-      clientId,
-      name: parsed.data.name, // initial sticky name
+      clientId: parsed.data.clientId,
+      name: parsed.data.name,
       cards,
       activeCard: 0,
       autoMark: useAuto,
@@ -283,8 +313,9 @@ io.on("connection", (socket) => {
       lastClaimAt: 0,
       lastSocketId: socket.id,
     };
-    room.players.set(clientId, player);
+    room.players.set(player.clientId, player);
 
+    await putRoom(room);
     cb({
       ok: true,
       cards: player.cards,
@@ -293,45 +324,38 @@ io.on("connection", (socket) => {
       activeCard: player.activeCard,
       name: player.name,
     });
-    io.to(code).emit("room:updated", summarize(room));
+    io.to(room.code).emit("room:updated", summarize(room));
   });
 
-  /** Player: switch active card */
-  socket.on("player:switch_card", (code: string, clientId: string, cardIndex: number) => {
-    code = norm(code);
-    const room = rooms.get(code);
+  socket.on("player:switch_card", async (code: string, clientId: string, cardIndex: number) => {
+    const room = await getRoom(code);
     if (!room) return;
     const p = room.players.get(clientId);
     if (!p) return;
-    const idx = clamp(cardIndex, 0, p.cards.length - 1);
-    p.activeCard = idx;
-    io.to(clientId).emit("player:active_card", idx);
+    p.activeCard = clamp(cardIndex, 0, p.cards.length - 1);
+    await putRoom(room);
+    io.to(clientId).emit("player:active_card", p.activeCard);
   });
 
-  /** Player: update marks (manual mode) */
-  socket.on("player:update_marks", (code: string, clientId: string, cardIndex: number, marks: [number, number][]) => {
-    code = norm(code);
-    const room = rooms.get(code);
+  socket.on("player:update_marks", async (code: string, clientId: string, cardIndex: number, marks: [number, number][]) => {
+    const room = await getRoom(code);
     if (!room) return;
-    const player = room.players.get(clientId);
-    if (!player || !player.manual) return;
-    const idx = clamp(cardIndex, 0, player.cards.length - 1);
-    player.marks[idx] = sanitizeMarks(marks);
+    const p = room.players.get(clientId);
+    if (!p || !p.manual) return;
+    const idx = clamp(cardIndex, 0, p.cards.length - 1);
+    p.marks[idx] = sanitizeMarks(marks);
+    await putRoom(room);
   });
 
-  /** Player: claim bingo (per card) */
-  socket.on("player:claim_bingo", (code: string, clientId: string, cardIndex: number, cb: (res: { ok: boolean; msg?: string }) => void) => {
-    code = norm(code);
-    const room = rooms.get(code);
+  socket.on("player:claim_bingo", async (code: string, clientId: string, cardIndex: number, cb: (res: { ok: boolean; msg?: string }) => void) => {
+    const room = await getRoom(code);
     if (!room) return cb({ ok: false, msg: "Room not found" });
 
     const player = room.players.get(clientId);
     if (!player) return cb({ ok: false, msg: "Player not in room" });
 
     const now = Date.now();
-    if (player.lastClaimAt && now - player.lastClaimAt < 2000) {
-      return cb({ ok: false, msg: "Please wait before claiming again" });
-    }
+    if (player.lastClaimAt && now - player.lastClaimAt < 2000) return cb({ ok: false, msg: "Please wait before claiming again" });
     player.lastClaimAt = now;
 
     const idx = clamp(cardIndex, 0, player.cards.length - 1);
@@ -344,8 +368,8 @@ io.on("connection", (socket) => {
         const v = card?.[r]?.[c];
         return v === 0 || calledSet.has(v);
       });
-      if (player.marks[idx].length !== before) {
-        io.to(player.lastSocketId || "").emit("player:marks_corrected", { cardIndex: idx, marks: player.marks[idx] });
+      if (player.marks[idx].length !== before && player.lastSocketId) {
+        io.to(player.lastSocketId).emit("player:marks_corrected", { cardIndex: idx, marks: player.marks[idx] });
       }
     }
 
@@ -364,15 +388,17 @@ io.on("connection", (socket) => {
       };
       const brief: RoundWinner = { playerId: winner.playerId, name: winner.name, pattern: winner.pattern, at: winner.at, cardIndex: idx };
       room.winners.push(brief);
-      io.to(code).emit("game:winner", winner);
-      io.to(code).emit("room:winners", room.winners);
-      io.to(code).emit("room:updated", summarize(room));
+      await putRoom(room);
+      io.to(room.code).emit("game:winner", winner);
+      io.to(room.code).emit("room:winners", room.winners);
+      io.to(room.code).emit("room:updated", summarize(room));
+    } else {
+      await putRoom(room);
     }
 
     cb({ ok: true });
   });
 
-  /** Keep players in memory; just clear socket index */
   socket.on("disconnecting", () => {
     const info = socketIndex.get(socket.id);
     if (info) socketIndex.delete(socket.id);
@@ -381,4 +407,8 @@ io.on("connection", (socket) => {
 
 app.get("/", (_req, res) => res.send("Bingo Realtime Server OK"));
 const PORT = Number(process.env.PORT || 4000);
-server.listen(PORT, "0.0.0.0", () => console.log(`✅ Socket.IO server on :${PORT}`));
+server.listen(PORT, "0.0.0.0", async () => {
+  try { await getRedis(); console.log("✅ Redis connected"); }
+  catch (e) { console.error("❌ Redis connection failed", e); }
+  console.log(`✅ Socket.IO server on :${PORT}`);
+});

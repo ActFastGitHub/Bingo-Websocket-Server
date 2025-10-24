@@ -1,19 +1,19 @@
 import type { PatternType } from "./patterns";
 
 export type Player = {
-  clientId: string;                 // stable identity
-  name: string;                     // sticky name for this room
-  cards: number[][][];              // multiple 5x5 cards
-  activeCard: number;               // index
+  clientId: string;
+  name: string;
+  cards: number[][][];
+  activeCard: number;
   autoMark?: boolean;
   manual?: boolean;
-  marks: [number, number][][];      // per-card manual marks
+  marks: [number, number][][];
   lastClaimAt?: number;
-  lastSocketId?: string;
+  lastSocketId?: string; // ephemeral
 };
 
 export type BingoWinner = {
-  playerId: string;                 // clientId
+  playerId: string;
   name: string;
   cardIndex: number;
   pattern: string;
@@ -35,12 +35,12 @@ export type RoomState = {
   seed: number;
   deck: number[];
   called: number[];
-  players: Map<string, Player>;     // key = clientId
+  players: Map<string, Player>;
   started: boolean;
   pattern: PatternType;
-  allowAutoMark: boolean;           // policy
-  lockLobbyOnStart: boolean;        // host preference
-  locked: boolean;                  // current room lock state (no new joins)
+  allowAutoMark: boolean;
+  lockLobbyOnStart: boolean;
+  locked: boolean;
   roundId: number;
   winners: RoundWinner[];
 };

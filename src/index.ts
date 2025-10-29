@@ -1,3 +1,4 @@
+// // src/index.ts
 // import express from "express";
 // import http from "http";
 // import cors from "cors";
@@ -6,10 +7,10 @@
 // import { createAdapter } from "@socket.io/redis-adapter";
 // import { createClient } from "redis";
 
-// import { RoomState, Player, BingoWinner, RoundWinner } from "./types";
+// import { RoomState, BingoWinner, RoundWinner } from "./types";
 // import { makeCard, makeDeck } from "./game";
 // import { PatternType, hasPattern } from "./patterns";
-// import { saveRoom, loadRoom } from "./store";
+// import { saveRoom, loadRoom, deleteRoom as deleteRoomFromStore } from "./store";
 // import { getRedis } from "./redis";
 // import { mountAdmin } from "./admin";
 
@@ -59,6 +60,10 @@
 // async function putRoom(room: RoomState) {
 // 	rooms.set(room.code, room);
 // 	await saveRoom(room);
+// }
+// async function forgetRoom(code: string) {
+// 	rooms.delete(code);
+// 	await deleteRoomFromStore(code);
 // }
 
 // const socketIndex = new Map<string, { code: string; clientId: string }>();
@@ -135,6 +140,12 @@
 // 		cb({ ok: true, summary: summarize(room) });
 // 	});
 
+// 	// OPTIONAL: list current rooms for discovery on the join screen
+// 	socket.on("room:list", async (cb: (r: { ok: boolean; rooms?: any[] }) => void) => {
+// 		const list = Array.from(rooms.values()).map(summarize);
+// 		cb({ ok: true, rooms: list });
+// 	});
+
 // 	// HOST create
 // 	socket.on(
 // 		"host:create_room",
@@ -164,7 +175,7 @@
 // 		}
 // 	);
 
-// 	// HOST — strict validations
+// 	// HOST strict validations
 // 	socket.on("host:set_pattern", async (payload: { code: string; hostKey: string; pattern: PatternType }) => {
 // 		const p = KeySchema.safeParse(payload);
 // 		if (!p.success) return;
@@ -181,8 +192,7 @@
 // 		if (!p.success) return;
 // 		const room = await getRoom(p.data.code);
 // 		if (!room || room.hostKey !== p.data.hostKey) return;
-// 		// allowed mid-round
-// 		room.allowAutoMark = !!payload.allow;
+// 		room.allowAutoMark = !!payload.allow; // allowed mid-round
 // 		if (!room.allowAutoMark) {
 // 			for (const pl of room.players.values()) {
 // 				pl.autoMark = false;
@@ -220,13 +230,14 @@
 // 		io.to(room.code).emit("room:updated", summarize(room));
 // 	});
 
-// 	// START / END
+// 	// START / END — ✅ True restart each round
 // 	socket.on("host:start", async (payload: { code: string; hostKey: string }) => {
 // 		const p = KeySchema.safeParse(payload);
 // 		if (!p.success) return;
 // 		const room = await getRoom(p.data.code);
 // 		if (!room || room.hostKey !== p.data.hostKey) return;
 // 		if (room.started) return; // 🚫 already started
+
 // 		room.started = true;
 // 		room.called = [];
 // 		room.deck = makeDeck(room.seed);
@@ -236,12 +247,30 @@
 // 			room.locked = true;
 // 			io.to(room.code).emit("policy:locked", true);
 // 		}
+
+// 		// 🔄 NEW CARDS PER ROUND (deterministic on round)
 // 		for (const pl of room.players.values()) {
+// 			const count = clamp(pl.cards.length, 1, 4);
+// 			const nextCards: number[][][] = [];
+// 			for (let i = 0; i < count; i++) {
+// 				const salt = hashStr(`${pl.clientId}#${room.roundId}#${i}`);
+// 				nextCards.push(makeCard(room.seed, salt));
+// 			}
+// 			pl.cards = nextCards;
+// 			pl.activeCard = 0;
 // 			pl.marks = pl.cards.map(() => []);
 // 			pl.lastClaimAt = 0;
+// 			if (pl.lastSocketId)
+// 				io.to(pl.lastSocketId).emit("player:new_round", {
+// 					cards: pl.cards,
+// 					activeCard: pl.activeCard,
+// 					roundId: room.roundId
+// 				});
 // 		}
+
 // 		await putRoom(room);
 // 		io.to(room.code).emit("game:started", { code: room.code, roundId: room.roundId });
+// 		io.to(room.code).emit("room:winners", room.winners);
 // 		io.to(room.code).emit("room:updated", summarize(room));
 // 	});
 
@@ -281,7 +310,30 @@
 // 		io.to(room.code).emit("game:undo", { history: room.called, roundId: room.roundId });
 // 	});
 
-// 	// PLAYER join / marks / claim (unchanged)
+// 	// NEW: Host deletes room (true cleanup)
+// 	socket.on(
+// 		"host:delete_room",
+// 		async (payload: { code: string; hostKey: string }, cb?: (r: { ok: boolean }) => void) => {
+// 			const p = KeySchema.safeParse(payload);
+// 			if (!p.success) return cb?.({ ok: false });
+// 			const room = await getRoom(p.data.code);
+// 			if (!room || room.hostKey !== p.data.hostKey) return cb?.({ ok: false });
+
+// 			// Notify occupants, then disconnect them from the room
+// 			io.to(room.code).emit("room:deleted", { code: room.code });
+// 			for (const [sid, info] of socketIndex.entries()) {
+// 				if (info.code === room.code) {
+// 					const s = io.sockets.sockets.get(sid);
+// 					s?.leave(room.code);
+// 				}
+// 			}
+
+// 			await forgetRoom(room.code);
+// 			cb?.({ ok: true });
+// 		}
+// 	);
+
+// 	// PLAYER join / marks / claim
 // 	socket.on("player:join", async (payload, cb) => {
 // 		const parsed = JoinSchema.safeParse(payload);
 // 		if (!parsed.success) return cb({ ok: false, msg: "Invalid join data" });
@@ -312,7 +364,7 @@
 // 		const count = clamp(parsed.data.cardCount ?? 1, 1, 4);
 // 		const cards: number[][][] = [];
 // 		for (let i = 0; i < count; i++) {
-// 			const salt = hashStr(`${parsed.data.clientId}#${i}`);
+// 			const salt = hashStr(`${parsed.data.clientId}#${room.roundId || 0}#${i}`); // round-aware
 // 			cards.push(makeCard(room.seed, salt));
 // 		}
 
@@ -447,6 +499,8 @@
 // 	console.log(`✅ Socket.IO server on :${PORT}`);
 // });
 
+
+// src/index.ts	
 import express from "express";
 import http from "http";
 import cors from "cors";
@@ -458,7 +512,7 @@ import { createClient } from "redis";
 import { RoomState, BingoWinner, RoundWinner } from "./types";
 import { makeCard, makeDeck } from "./game";
 import { PatternType, hasPattern } from "./patterns";
-import { saveRoom, loadRoom, deleteRoom as deleteRoomFromStore } from "./store";
+import { saveRoom, loadRoom, deleteRoom as deleteRoomFromStore, listRoomCodes } from "./store";
 import { getRedis } from "./redis";
 import { mountAdmin } from "./admin";
 
@@ -468,11 +522,8 @@ const makeHostKey = () =>
 	[...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, "0")).join("");
 
 const app = express();
-
-// ⚠️ Add your Vercel domain here
 const allowedOrigins = ["http://localhost:3000", "https://YOUR-VERCEL-APP.vercel.app"];
 app.use(cors({ origin: allowedOrigins, methods: ["GET", "POST"] }));
-
 mountAdmin(app);
 
 const server = http.createServer(app);
@@ -481,7 +532,7 @@ const io = new Server(server, {
 	transports: ["websocket", "polling"]
 });
 
-// Socket.IO Redis adapter
+// adapter
 async function setupAdapter() {
 	const url = process.env.REDIS_URL;
 	if (!url) {
@@ -499,7 +550,7 @@ async function setupAdapter() {
 }
 setupAdapter().catch(console.error);
 
-// in-memory cache + redis
+// memory + redis
 const rooms = new Map<string, RoomState>();
 async function getRoom(code: string) {
 	const c = norm(code);
@@ -532,7 +583,6 @@ function hashStr(s: string) {
 	}
 	return Math.abs(h >>> 0);
 }
-
 function sanitizeMarks(m: [number, number][]) {
 	const out: [number, number][] = [];
 	const seen = new Set<string>();
@@ -547,11 +597,11 @@ function sanitizeMarks(m: [number, number][]) {
 	}
 	return out;
 }
-
 function summarize(room: RoomState) {
 	return {
 		code: room.code,
 		started: room.started,
+		paused: !!room.paused,
 		calledCount: room.called.length,
 		last: room.called.length ? room.called[room.called.length - 1] : null,
 		players: Array.from(room.players.values()).map(p => ({ id: p.clientId, name: p.name, cards: p.cards.length })),
@@ -588,10 +638,11 @@ io.on("connection", socket => {
 		cb({ ok: true, summary: summarize(room) });
 	});
 
-	// OPTIONAL: list current rooms for discovery on the join screen
+	// discovery list comes from Redis to avoid stale cache if admin deleted
 	socket.on("room:list", async (cb: (r: { ok: boolean; rooms?: any[] }) => void) => {
-		const list = Array.from(rooms.values()).map(summarize);
-		cb({ ok: true, rooms: list });
+		const codes = await listRoomCodes();
+		const roomsLoaded = await Promise.all(codes.map(c => loadRoom(c)));
+		cb({ ok: true, rooms: roomsLoaded.filter(Boolean).map(r => summarize(r!)) });
 	});
 
 	// HOST create
@@ -608,6 +659,7 @@ io.on("connection", socket => {
 				called: [],
 				players: new Map(),
 				started: false,
+				paused: false,
 				pattern: "line",
 				allowAutoMark: true,
 				lockLobbyOnStart: true,
@@ -623,13 +675,13 @@ io.on("connection", socket => {
 		}
 	);
 
-	// HOST strict validations
+	// HOST settings (unchanged except we re-emit summarizes)
 	socket.on("host:set_pattern", async (payload: { code: string; hostKey: string; pattern: PatternType }) => {
 		const p = KeySchema.safeParse(payload);
 		if (!p.success) return;
 		const room = await getRoom(p.data.code);
 		if (!room || room.hostKey !== p.data.hostKey) return;
-		if (room.started) return; // 🚫 cannot change pattern mid-round
+		if (room.started) return;
 		room.pattern = payload.pattern;
 		await putRoom(room);
 		io.to(room.code).emit("room:updated", summarize(room));
@@ -640,7 +692,7 @@ io.on("connection", socket => {
 		if (!p.success) return;
 		const room = await getRoom(p.data.code);
 		if (!room || room.hostKey !== p.data.hostKey) return;
-		room.allowAutoMark = !!payload.allow; // allowed mid-round
+		room.allowAutoMark = !!payload.allow;
 		if (!room.allowAutoMark) {
 			for (const pl of room.players.values()) {
 				pl.autoMark = false;
@@ -678,15 +730,15 @@ io.on("connection", socket => {
 		io.to(room.code).emit("room:updated", summarize(room));
 	});
 
-	// START / END — ✅ True restart each round
+	// START / END — true restart, clear paused
 	socket.on("host:start", async (payload: { code: string; hostKey: string }) => {
 		const p = KeySchema.safeParse(payload);
 		if (!p.success) return;
 		const room = await getRoom(p.data.code);
 		if (!room || room.hostKey !== p.data.hostKey) return;
-		if (room.started) return; // 🚫 already started
-
+		if (room.started) return;
 		room.started = true;
+		room.paused = false;
 		room.called = [];
 		room.deck = makeDeck(room.seed);
 		room.roundId += 1;
@@ -695,16 +747,15 @@ io.on("connection", socket => {
 			room.locked = true;
 			io.to(room.code).emit("policy:locked", true);
 		}
-
-		// 🔄 NEW CARDS PER ROUND (deterministic on round)
+		// regenerate cards per round
 		for (const pl of room.players.values()) {
-			const count = clamp(pl.cards.length, 1, 4);
-			const nextCards: number[][][] = [];
+			const count = clamp(pl.cards.length || 1, 1, 4);
+			const next: number[][][] = [];
 			for (let i = 0; i < count; i++) {
 				const salt = hashStr(`${pl.clientId}#${room.roundId}#${i}`);
-				nextCards.push(makeCard(room.seed, salt));
+				next.push(makeCard(room.seed, salt));
 			}
-			pl.cards = nextCards;
+			pl.cards = next;
 			pl.activeCard = 0;
 			pl.marks = pl.cards.map(() => []);
 			pl.lastClaimAt = 0;
@@ -715,7 +766,6 @@ io.on("connection", socket => {
 					roundId: room.roundId
 				});
 		}
-
 		await putRoom(room);
 		io.to(room.code).emit("game:started", { code: room.code, roundId: room.roundId });
 		io.to(room.code).emit("room:winners", room.winners);
@@ -728,20 +778,21 @@ io.on("connection", socket => {
 		const room = await getRoom(p.data.code);
 		if (!room || room.hostKey !== p.data.hostKey) return;
 		if (!room.started) return;
-		room.started = false; // keep called history visible until next start
+		room.started = false;
+		room.paused = false; // keep called history visible
 		await putRoom(room);
 		io.to(room.code).emit("game:ended", { code: room.code, roundId: room.roundId });
 		io.to(room.code).emit("room:updated", summarize(room));
 	});
 
-	// CALL / UNDO
+	// CALL / UNDO — block when paused
 	socket.on("host:call_next", async (payload: { code: string; hostKey: string }) => {
 		const p = KeySchema.safeParse(payload);
 		if (!p.success) return;
 		const room = await getRoom(p.data.code);
-		if (!room || !room.started || room.hostKey !== p.data.hostKey) return;
+		if (!room || !room.started || room.hostKey !== p.data.hostKey || room.paused) return;
 		const next = room.deck.shift();
-		if (!next) return; // 🚫 deck empty
+		if (!next) return;
 		room.called.push(next);
 		await putRoom(room);
 		io.to(room.code).emit("game:called", { n: next, history: room.called, roundId: room.roundId });
@@ -751,14 +802,15 @@ io.on("connection", socket => {
 		const p = KeySchema.safeParse(payload);
 		if (!p.success) return;
 		const room = await getRoom(p.data.code);
-		if (!room || !room.started || room.hostKey !== p.data.hostKey || room.called.length === 0) return;
+		if (!room || !room.started || room.hostKey !== p.data.hostKey || room.called.length === 0 || room.paused)
+			return;
 		const last = room.called.pop()!;
 		room.deck.unshift(last);
 		await putRoom(room);
 		io.to(room.code).emit("game:undo", { history: room.called, roundId: room.roundId });
 	});
 
-	// NEW: Host deletes room (true cleanup)
+	// Host deletes room
 	socket.on(
 		"host:delete_room",
 		async (payload: { code: string; hostKey: string }, cb?: (r: { ok: boolean }) => void) => {
@@ -766,22 +818,16 @@ io.on("connection", socket => {
 			if (!p.success) return cb?.({ ok: false });
 			const room = await getRoom(p.data.code);
 			if (!room || room.hostKey !== p.data.hostKey) return cb?.({ ok: false });
-
-			// Notify occupants, then disconnect them from the room
 			io.to(room.code).emit("room:deleted", { code: room.code });
 			for (const [sid, info] of socketIndex.entries()) {
-				if (info.code === room.code) {
-					const s = io.sockets.sockets.get(sid);
-					s?.leave(room.code);
-				}
+				if (info.code === room.code) io.sockets.sockets.get(sid)?.leave(room.code);
 			}
-
 			await forgetRoom(room.code);
 			cb?.({ ok: true });
 		}
 	);
 
-	// PLAYER join / marks / claim
+	// PLAYER
 	socket.on("player:join", async (payload, cb) => {
 		const parsed = JoinSchema.safeParse(payload);
 		if (!parsed.success) return cb({ ok: false, msg: "Invalid join data" });
@@ -812,10 +858,9 @@ io.on("connection", socket => {
 		const count = clamp(parsed.data.cardCount ?? 1, 1, 4);
 		const cards: number[][][] = [];
 		for (let i = 0; i < count; i++) {
-			const salt = hashStr(`${parsed.data.clientId}#${room.roundId || 0}#${i}`); // round-aware
+			const salt = hashStr(`${parsed.data.clientId}#${room.roundId || 0}#${i}`);
 			cards.push(makeCard(room.seed, salt));
 		}
-
 		const useAuto = room.allowAutoMark ? parsed.data.autoMark ?? true : false;
 		const useManual = room.allowAutoMark ? parsed.data.manual ?? !useAuto : true;
 		const incomingMarks = parsed.data.marks ?? [];
@@ -869,13 +914,16 @@ io.on("connection", socket => {
 		}
 	);
 
+	// Claims are blocked when paused
 	socket.on(
 		"player:claim_bingo",
 		async (code: string, clientId: string, cardIndex: number, cb: (r: { ok: boolean; msg?: string }) => void) => {
 			const room = await getRoom(code);
 			if (!room) return cb({ ok: false, msg: "Room not found" });
+			if (room.paused) return cb({ ok: false, msg: "Round paused by host" });
 			const player = room.players.get(clientId);
 			if (!player) return cb({ ok: false, msg: "Player not in room" });
+
 			const now = Date.now();
 			if (player.lastClaimAt && now - player.lastClaimAt < 2000)
 				return cb({ ok: false, msg: "Please wait before claiming again" });
@@ -901,6 +949,7 @@ io.on("connection", socket => {
 			const valid = hasPattern(card, calledSet, room.pattern);
 			if (!valid) return cb({ ok: false, msg: "Pattern not satisfied yet" });
 
+			// first valid winner pauses the game
 			if (!room.winners.some(w => w.playerId === player.clientId)) {
 				const winner: BingoWinner = {
 					playerId: player.clientId,
@@ -919,11 +968,15 @@ io.on("connection", socket => {
 					cardIndex: idx
 				};
 				room.winners.push(brief);
+				// ⏸️ Pause the round after first winner
+				room.paused = true;
 				await putRoom(room);
 				io.to(room.code).emit("game:winner", winner);
 				io.to(room.code).emit("room:winners", room.winners);
 				io.to(room.code).emit("room:updated", summarize(room));
-			} else await putRoom(room);
+			} else {
+				await putRoom(room);
+			}
 
 			cb({ ok: true });
 		}
